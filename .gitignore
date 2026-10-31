@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 秘密情報（APIキー・DBパスワード）。.env.example / .env.local.example だけをコミットする
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# 実行時にダウンロードするデータ（JPX上場銘柄一覧など）
+backend/data/
+
+# OS・エディタ・ログ
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.log
+npm-debug.log*
