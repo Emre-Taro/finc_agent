@@ -1,6 +1,11 @@
-"""金融指標の取得（FRED API + Yahoo Finance）。"""
+"""金融指標の取得（FRED API + Yahoo Finance + 財務省 国債金利）。
+
+保存するのは各日の確定値（終値）だけ。取引中の当日分は取り込まない。
+"""
 
 import asyncio
+import csv
+import io
 import logging
 import math
 from dataclasses import dataclass
@@ -8,6 +13,7 @@ from datetime import date, timedelta
 from typing import Any
 
 import httpx
+import pandas as pd
 import yfinance as yf
 
 from .config import get_settings
@@ -21,15 +27,15 @@ class Indicator:
     code: str
     name: str
     unit: str
-    source: str  # "fred" | "yahoo"
-    series: str
+    source: str  # "fred" | "yahoo" | "mof"
+    series: str  # mof の場合は CSV の列名（"10年" など）
     fred_units: str = "lin"  # FRED の変換。pc1 = 前年同月比(%)
 
 
 INDICATORS: list[Indicator] = [
     Indicator("US10Y", "米10年債利回り", "%", "fred", "DGS10"),
     Indicator("US2Y", "米2年債利回り", "%", "fred", "DGS2"),
-    Indicator("JGB10Y", "日本10年債利回り（月次）", "%", "fred", "IRLTLT01JPM156N"),
+    Indicator("JGB10Y", "日本10年債利回り", "%", "mof", "10年"),
     Indicator("FED_FUNDS", "FF金利（実効）", "%", "fred", "DFF"),
     Indicator("US_BREAKEVEN10Y", "米10年期待インフレ率", "%", "fred", "T10YIE"),
     Indicator("US_CPI_YOY", "米CPI 前年比", "%", "fred", "CPIAUCSL", "pc1"),
@@ -63,13 +69,54 @@ async def _fetch_fred(client: httpx.AsyncClient, ind: Indicator, api_key: str) -
     return [(o["date"], float(o["value"])) for o in resp.json()["observations"] if o["value"] != "."]
 
 
-def _fetch_yahoo_sync(ind: Indicator) -> list[tuple[str, float]]:
-    hist = yf.Ticker(ind.series).history(period="1y", interval="1d", auto_adjust=False)
-    return [
+# 財務省「国債金利情報」。過去分（前月末まで）と当月分が別ファイル。値は各営業日の引け後の基準気配
+_MOF_URLS = (
+    "https://www.mof.go.jp/jgbs/reference/interest_rate/data/jgbcm_all.csv",
+    "https://www.mof.go.jp/jgbs/reference/interest_rate/jgbcm.csv",
+)
+_ERA_BASE = {"S": 1925, "H": 1988, "R": 2018}
+
+
+def _parse_wareki(s: str) -> date | None:
+    """"R8.10.1" のような和暦の日付を date にする。日付でない行は None"""
+    era, _, rest = s.partition(".")
+    if len(era) < 2 or era[0] not in _ERA_BASE:
+        return None
+    y, m, d = era[1:], *rest.split(".")
+    return date(_ERA_BASE[era[0]] + int(y), int(m), int(d))
+
+
+async def _fetch_mof(client: httpx.AsyncClient, ind: Indicator) -> list[tuple[str, float]]:
+    start = date.today() - timedelta(days=_HISTORY_DAYS)
+    out: dict[str, float] = {}
+    for url in _MOF_URLS:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        rows = list(csv.reader(io.StringIO(resp.content.decode("cp932"))))
+        col = rows[1].index(ind.series)  # 1行目はタイトル、2行目が見出し
+        for r in rows[2:]:
+            d = _parse_wareki(r[0]) if r else None
+            if d and d >= start and len(r) > col and r[col] not in ("", "-"):
+                out[d.isoformat()] = float(r[col])
+    return sorted(out.items())
+
+
+def _fetch_yahoo_sync(ind: Indicator) -> tuple[list[tuple[str, float]], str | None]:
+    """日足の終値を返す。取引中で終値が確定していない当日の足は除き、その日付も返す"""
+    ticker = yf.Ticker(ind.series)
+    hist = ticker.history(period="1y", interval="1d", auto_adjust=False)
+    rows = [
         (idx.date().isoformat(), float(close))
         for idx, close in hist["Close"].items()
         if not math.isnan(close)
     ]
+    # 当日のセッション終了時刻（取引所のタイムゾーン）より前なら、最後の足はまだ途中の値
+    session_end = ticker.history_metadata.get("currentTradingPeriod", {}).get("regular", {}).get("end")
+    if rows and session_end is not None:
+        session_end = pd.Timestamp(session_end)
+        if rows[-1][0] == session_end.date().isoformat() and pd.Timestamp.now(tz=session_end.tz) < session_end:
+            return rows[:-1], rows[-1][0]
+    return rows, None
 
 
 async def refresh_indicators() -> dict[str, Any]:
@@ -78,11 +125,13 @@ async def refresh_indicators() -> dict[str, Any]:
 
     async with httpx.AsyncClient(timeout=20) as client:
 
-        async def fetch(ind: Indicator) -> list[tuple[str, float]]:
+        async def fetch(ind: Indicator) -> tuple[list[tuple[str, float]], str | None]:
             if ind.source == "fred":
                 if not api_key:
                     raise RuntimeError("FRED_API_KEY が未設定です")
-                return await _fetch_fred(client, ind, api_key)
+                return await _fetch_fred(client, ind, api_key), None
+            if ind.source == "mof":
+                return await _fetch_mof(client, ind), None
             return await asyncio.to_thread(_fetch_yahoo_sync, ind)
 
         results = await asyncio.gather(*(fetch(i) for i in INDICATORS), return_exceptions=True)
@@ -92,10 +141,22 @@ async def refresh_indicators() -> dict[str, Any]:
             log.warning("indicator %s failed: %r", ind.code, result)
             stats["errors"][ind.code] = repr(result)
             continue
-        rows = [(ind.code, date.fromisoformat(d), v, ind.source) for d, v in result]
+        points, unsettled = result
+        rows = [(ind.code, date.fromisoformat(d), v, ind.source) for d, v in points]
+        pool = await db.get_pool()
+        if unsettled:
+            # 以前に取引中の値を保存していたら消す（終値が確定した後の更新で入れ直す）
+            await pool.execute(
+                "delete from indicator_observations where indicator_code = $1 and observed_on = $2",
+                ind.code, date.fromisoformat(unsettled),
+            )
         if rows:
+            # 取得元を切り替えた指標は、旧取得元の値と混ざらないように消す
+            await pool.execute(
+                "delete from indicator_observations where indicator_code = $1 and source <> $2",
+                ind.code, ind.source,
+            )
             # (indicator_code, observed_on) が主キーなので何度更新しても重複しない
-            pool = await db.get_pool()
             await pool.executemany(
                 """
                 insert into indicator_observations (indicator_code, observed_on, value, source)
@@ -109,8 +170,8 @@ async def refresh_indicators() -> dict[str, Any]:
     return stats
 
 
-async def latest_indicators(history_days: int = 180) -> list[dict[str, Any]]:
-    """各指標の最新値・前回値・変化幅と、チャート用の履歴を返す。
+async def latest_indicators(history_days: int = 180, code: str | None = None) -> list[dict[str, Any]]:
+    """各指標の最新値・前回値・変化幅と、チャート用の履歴を返す。code を渡すとその指標だけ。
 
     月次指標は発表が1か月以上遅れるので、最新値・前回値は期間外でも直近2件を必ず含める。
     """
@@ -120,11 +181,13 @@ async def latest_indicators(history_days: int = 180) -> list[dict[str, Any]]:
         from (
             select *, row_number() over (partition by indicator_code order by observed_on desc) as rn
             from indicator_observations
+            where $2::text is null or indicator_code = $2
         ) t
         where observed_on >= $1 or rn <= 2
         order by indicator_code, observed_on
         """,
         date.today() - timedelta(days=history_days),
+        code,
     )
     by_code: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
@@ -132,6 +195,8 @@ async def latest_indicators(history_days: int = 180) -> list[dict[str, Any]]:
 
     out = []
     for ind in INDICATORS:
+        if code is not None and ind.code != code:
+            continue
         points = by_code.get(ind.code, [])
         hist = [{"observed_on": p["observed_on"], "value": p["value"]} for p in points if p["in_window"]]
         latest = points[-1] if points else None

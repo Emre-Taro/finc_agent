@@ -83,6 +83,10 @@ export type Indicator = {
   history: { observed_on: string; value: number }[];
 };
 
+export type IndicatorDetail = Indicator & {
+  news: { id: string; published_at: string | null; title: string; url: string; source: string; score: number; reason: string | null }[];
+};
+
 export type CompanyScore = {
   id: string;
   ticker: string;
