@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from . import db, runs, tickers
 from .config import get_settings
-from .indicators import latest_indicators, refresh_indicators
+from .indicators import BY_CODE, latest_indicators, refresh_indicators
 from .ingest import ingest_news, reanalyze
 from .scoring import WEIGHTS, score_all, score_company
 from .taxonomy import NEWS_INDICATORS, SECTORS
@@ -146,6 +146,26 @@ async def indicators_refresh():
 @app.get("/api/indicators")
 async def indicators(history_days: int = Query(180, ge=1, le=400)):
     return await latest_indicators(history_days)
+
+
+@app.get("/api/indicators/{code}")
+async def indicator_detail(code: str, history_days: int = Query(400, ge=1, le=400), news_limit: int = Query(20, le=100)):
+    """1指標の詳細（長めの履歴 + その指標に影響すると評価されたニュース）。"""
+    if code not in BY_CODE:
+        raise HTTPException(404)
+    [ind] = await latest_indicators(history_days, code)
+    ind["news"] = await db.fetch(
+        """
+        select n.id, n.published_at, n.title, n.url, n.source, i.score, i.reason
+        from news_impacts i
+        join news n on n.id = i.news_id
+        where i.target_type = 'indicator' and i.target_code = $1 and i.score <> 0
+        order by n.published_at desc nulls last
+        limit $2
+        """,
+        code, news_limit,
+    )
+    return ind
 
 
 # ---- 銘柄スコア ----------------------------------------------------------

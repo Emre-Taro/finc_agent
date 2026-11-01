@@ -6,6 +6,7 @@ import {
   type ImpactSummary, type Indicator, type NewsDetail, type NewsItem, type Run, type Taxonomy,
 } from "@/lib/api";
 import { Direction, ScoreChip, Sparkline } from "@/components/Score";
+import { IndicatorModal } from "@/components/IndicatorModal";
 
 const SOURCES = ["Bloomberg", "Reuters", "Financial Times", "日本経済新聞"];
 const PAGE = 50;
@@ -24,6 +25,7 @@ function runLabel(r: Run) {
 export default function Dashboard() {
   const [tax, setTax] = useState<Taxonomy | null>(null);
   const [indicators, setIndicators] = useState<Indicator[]>([]);
+  const [openIndicator, setOpenIndicator] = useState<Indicator | null>(null);
   const [summary, setSummary] = useState<ImpactSummary[]>([]);
   const [summaryDays, setSummaryDays] = useState(7);
   const [news, setNews] = useState<NewsItem[]>([]);
@@ -89,6 +91,8 @@ export default function Dashboard() {
     }
   }
 
+  const closeIndicator = useCallback(() => setOpenIndicator(null), []);
+
   const sectorSummary = summary.filter((s) => s.target_type === "sector").sort((a, b) => b.avg_score - a.avg_score);
   const indicatorSummary = summary.filter((s) => s.target_type === "indicator").sort((a, b) => b.avg_score - a.avg_score);
 
@@ -118,7 +122,15 @@ export default function Dashboard() {
         <h2>金融指標</h2>
         <div className="grid">
           {indicators.map((i) => (
-            <div className="card" key={i.code}>
+            <div
+              className="card clickable"
+              key={i.code}
+              role="button"
+              tabIndex={0}
+              title="クリックで詳しく見る"
+              onClick={() => setOpenIndicator(i)}
+              onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && (e.preventDefault(), setOpenIndicator(i))}
+            >
               <div className="small muted">{i.name}</div>
               <div className="value">
                 {i.latest === null ? "-" : i.latest.toLocaleString("ja-JP", { maximumFractionDigits: 2 })}
@@ -133,6 +145,7 @@ export default function Dashboard() {
           ))}
         </div>
         {indicators.every((i) => i.latest === null) && <p className="muted small">「金融指標を更新」を押してデータを取得してください。</p>}
+        {openIndicator && <IndicatorModal indicator={openIndicator} onClose={closeIndicator} />}
       </section>
 
       <section className="panel">
